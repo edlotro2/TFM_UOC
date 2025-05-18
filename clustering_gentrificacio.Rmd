@@ -1,0 +1,521 @@
+---
+title: "Clustering Gentrificació BCN"
+output: md_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# *Clustering* gentrificació a Barcelona
+
+En aquesta fase, una vegada ja es disposa dels diversos conjunts de dades correctament tractats, l'objectiu és aplicar mètodes no supervisats d'aprenentatge automàtica, com pot ser el *clustering* per *k-means.*
+
+A mesura que s'avance, s'aniran explicat les diferents característiques de les diferents tècniques aplicades.
+
+### Instal·lació de llibreries
+
+El primer que s'ha de fer és anar instal·lant i carregant les llibreries necessàries per a poder executar el codi a continuació.
+
+```{r}
+## Instal·lació llibreries
+if (!require(ModelMetrics)) install.packages("ModelMetrics"); library(ModelMetrics)
+if (!require(factoextra)) install.packages("factoextra"); library(factoextra)
+if (!require(corrplot)) install.packages("corrplot"); library(corrplot)
+if (!require(esquisse)) install.packages("esquisse"); library(esquisse)
+if (!require(dplyr)) install.packages("dplyr"); library(dplyr)
+if (!require(sf)) install.packages("sf"); library(sf)
+if (!require(knitr)) install.packages("knitr"); library(knitr)
+```
+
+### Anàlisi de Components Principals
+
+L'Anàlisi de Components Principals (PCA) és un tècnica de selecció de característiques que consisteix en l’eliminació de variables considerades com poc *importants*, encara que mantenint la part més rellevant de les mateixes. L’aspecte més rellevant d’aquesta tècnica resideix en què, una vegada ja s’ha aplicat, tots els nous camps que es disposen seran independents entre sí. Així, es podrà eliminar el soroll que s’haja pogut generar durant l’obtenció del conjunt de dades i el seu preprocessament.
+
+Per tant, fent ús d'aquesta tècnica es pot reduir el nombre de dimensions a components principals que conserven la major part de la informació general del conjunt de dades. S'aconsegueix transformant les variables potencialment correlaciones en un conjunt més reduït de variables, que es denominen components principals. Així, es possible que gràcies a l'aplicació d'aquesta tècnica es puguen minimitzar problemes com la multicolinealitat. Aquesta circumstància sorgeix quan dos o més variables independents estan altament correlacionades entre sí, fet que pot ser problemàtic per al model.
+
+A més, malgrat de disposar de dades des de l'any 2015, es va a generar el conjunt de clusters per als anys 2019, 2020, 2021, 2022 i 2023 de manera independent.
+
+```{r}
+## Càrrega del conjunt de dades
+path = 'V2/Poblacio_Clustering.csv'
+df_cluster <- read.csv(path, row.names = NULL)
+df_cluster$Codi_Barri <- sprintf("%02d", df_cluster$Codi_Barri)
+str(df_cluster)
+```
+
+Com que l'Anàlisi de Components Principals es basa en la variança, les variables amb valors grans (per exemple, *Renda_Mitjana)* dominen l'anàlisi, per escala, no per importància si no es normalitzen. Per tant, per evitar la falta de detecció de patrons a altres variables, resulta necessari normalitzar.
+
+```{r}
+## Vector anys escollits
+anys <- 2019:2023
+df_anys_norm <- list()
+
+## Normalització variables
+vars <- c("Pobl_Jove", "Perc_Jove", "Pobl_Regio", "Perc_Regio", 
+          "Pobl_Superior", "Perc_Superior", "Pobl_Host", "Perc_Host", 
+          "Renda_Mitjana", "Habitatges", "Preu_Lloguer")
+
+for (any in anys) {
+  df_any <- df_cluster[df_cluster$Data_Referencia == any, ]
+  var_norm <- df_any[, vars]
+  df_norm <- scale(var_norm)
+  df_norm <- df_norm[complete.cases(df_norm), ]
+  df_anys_norm[[as.character(any)]] <- df_norm
+}
+
+str(df_anys_norm)
+```
+
+Així, una vegada ja es disposa dels *datasets* normalitzats, ja es pot aplicar l'Anàlisi de Components Principals:
+
+```{r}
+## Anàlisi de Components Principals
+llista_pca <- lapply(df_anys_norm, prcomp)
+
+for (any in names(llista_pca)) {
+  cat("### PCA per a l'any", any, "###\n")
+  print(summary(llista_pca[[any]]))
+  cat("\n---------------------------\n")
+}
+```
+
+La funció *summary* retorna la proporció de variança aplicada al conjunt total per cada atribut. Així, es pot saber que la primera component principal explica el 49,86% de la variança total del model de l'any 2019. A més, només amb les quatre primeres components principals ja s'explica més del 93,2% del model, fet pel qual es pot sospitar que es podria reduir la dimensió a aquest nombre de components.
+
+També es pot mostrar a través d'un histograma el pes de cadascun dels components sobre el conjunt total de les dades:
+
+```{r}
+## Histograma del pes dels components
+llista_ev <- lapply(llista_pca, get_eig)
+for (any in names(llista_ev)) {
+  print(llista_ev[[any]])
+}
+```
+
+A banda, es pot graficar, a través d'un *scree plot* el percentatge de variança explicada per cada un dels components principals que s'han generat:
+
+```{r}
+## Representació scree plot
+llista_eig <- lapply(names(llista_pca), function(any) {
+  fviz_eig(llista_pca[[any]]) + ggtitle(paste("Scree plot per a l'any", any))
+})
+names(llista_eig) <- names(llista_pca)
+for (any in names(llista_eig)) {
+  print(llista_eig[[any]])
+}
+```
+
+Visualment es pot veure com, per a cadascun dels anys, el primer component explica quasi la meitat del model.
+
+```{r}
+##Càlcul de la variança dels CP a partir de la desviació estàndar
+llista_var <- lapply(llista_pca, function(pca) pca$sdev^2)
+llista_var
+```
+
+Atenent al *criteri de Káiser*, es seleccionen aquells components que tenen un valor de la variança superior a 1. En aquest cas, sembla tractar-se dels tres primers component, que compleixen amb la condició.
+
+Un valor propi superior a 1 indica que els components principals representen més variança de la que representa una de les variables originals de les dades normalitzades. S'utilitza habitualment com a punt de tall per a conservar el component principal.
+
+Continuant amb l'anàlisi dels components princiapls que s'han generat, es pot aprofitar la informació que es desprén del mateix per representar-los visualment:
+
+```{r}
+## Elements components principals
+cp <- get_pca_var(llista_pca[[any]])
+cp
+```
+
+Per al nostre anàlisi existeixen dades al voltant de les coordenades de les variables, amb els que crear un diagrama de dispersió. També es pot fer ús del quadrat del cosinus, per estudiar la qualitat de representació de les variables al mapa de factores. A més, es diposa del pes de les contribucions de cadascuna de les variables als components principals que s'han obtingut.
+
+```{r}
+## Ús dels 3 components principals localitzats
+llista_coord <- lapply(llista_pca, function(pca) {
+  get_pca_var(pca)$coord[, 1:3]
+})
+for (any in names(llista_coord)) {
+  cat("### Coordenades dels 3 primers components - Any", any, "###\n")
+  print(head(llista_coord[[any]], 11))
+  cat("\n---------------------------\n")
+}
+```
+
+#### Qualitat de representació
+
+La qualitat de representació de les variables en el mapa de factores es denomina cos2 (cosinus quadrat, coordenades quadrades). Es pot accedir al cos2 de la següent manera:
+
+```{r}
+## Extracció cosinus quadrat
+llista_coord <- lapply(llista_pca, function(pca) {
+  get_pca_var(pca)$cos2[, 1:3]
+})
+for (any in names(llista_coord)) {
+  cat("### Cosinus quadrat dels 3 primers components - Any", any, "###\n")
+  print(head(llista_coord[[any]], 11))
+  cat("\n---------------------------\n")
+}
+```
+
+Es pot representar la qualitat gràficament:
+
+```{r}
+## Representació gràfica qualitat
+for (any in names(llista_pca)) {
+  cp_any <- get_pca_var(llista_pca[[any]])
+  corrplot(cp_any$cos2[, 1:3], is.corr = FALSE,
+           title = paste("Cosinus quadrat variables - Any", any),
+           mar = c(0, 0, 2, 0)) 
+}
+```
+
+Adicionalment, es pot crear un diagrama de barres de variables cos2, amb la funció següent:
+
+```{r}
+## Diagrama de barres cosinus quadrat
+for (any in names(llista_pca)) {
+  print(
+    fviz_cos2(llista_pca[[any]], choice = "var", axes = 1:2) +
+      ggtitle(paste("Cosinus quadrat variables - Any", any))
+  )
+}
+```
+
+-   Un cos2 elevat indica una bona representació de la variable al component principal. En aquest cas, la variable es posiciona a prop de la circumferència de correlació.
+
+-   Un cos2 baix indica que la variable no està perfectament representada pels components principals. En aquest cas, la variable està a prop del centre del cercle.
+
+Per a d'algunes variables, poden ser necessaris més de dos components per representar perfectament les dades, En aquest cas, les variables es situen dins del cercle de correlacions.
+
+```{r}
+## Gràfica de correlació qualitat
+for (any in names(llista_pca)) {
+  print(
+    fviz_pca_var(
+      llista_pca[[any]],
+      col.var = "cos2",
+      gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+      repel = TRUE
+    ) + ggtitle(paste("Variables PCA - Any", any))
+  )
+}
+```
+
+#### Contribució
+
+Les contribucions de les variables en la comptabilització de la variabilitat d'un determinat component principal s'expressen en percentatge.
+
+Les variables que estan correlacionades amb PC1 i PC2 són les més importants per explicar la variabilitat al conjunt de dades. D'altra banda, les variables que no estan correlacionades amb cap component principal o amb les últimes dimensions, són variables amb una contribució baixa i es poden eliminar per simplificar l'anàlisi global.
+
+La contribució de les variables es pot extraure com segueix:
+
+```{r}
+## Extracció contribució variables
+llista_coord <- lapply(llista_pca, function(pca) {
+  get_pca_var(pca)$contrib[, 1:3]
+})
+for (any in names(llista_coord)) {
+  cat("### Contribucions variables dels 3 primers components - Any", any, "###\n")
+  print(head(llista_coord[[any]], 11))
+  cat("\n---------------------------\n")
+}
+```
+
+A major valor de la contribució, més contribució hi haurà al component:
+
+```{r}
+## Representació gràfica contribució
+for (any in names(llista_pca)) {
+  cp_any <- get_pca_var(llista_pca[[any]])
+  corrplot(cp_any$contrib[, 1:3], is.corr = FALSE,
+           title = paste("Contribucions variables - Any", any),
+           mar = c(0, 0, 2, 0)) 
+}
+```
+
+Les variables més importants, és a dir, que més contribueixen es poden destacar a la gràfica de correlació de la següent manera:
+
+```{r}
+## Gràfica de correlació contribució
+for (any in names(llista_pca)) {
+  print(
+    fviz_pca_var(
+      llista_pca[[any]],
+      col.var = "contrib",
+      gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+      repel = TRUE
+    ) + ggtitle(paste("Variables PCA - Any", any))
+  )
+}
+```
+
+Les variables correlacionades positives apunten al mateix costat de la trama. Per la seua part, les variables correlacionades negatives apunten en direccions contràries.
+
+### *Clustering*
+
+Seguidament, després d'haver portat a terme l'Anàlisi de Components Principals segmentat entre els anys 2019 i 2023, es pot generar un model no supervisat. En aquest cas, es va a generar un model a través de l'algorisme *k-means*. Es tracta d'un algorisme de classificació no supervisada (*clustering)* que agrupa les observacions del conjunt de dades basant-se en les seues característiques.
+
+#### Càlcul del nombre de clùsters òptims
+
+El pas més crític d'aquest mètode és determinar el valor del paràmetre *k,* és a dir, el nombre de clústers a obtenir. Per poder resoldre aquesta situació, es van a utilitzar algunes tècniques amb diferents criteris, que permetran escollir el nombre òptim de grups per a cada any.
+
+El primer dels mètodes que es va a utilitzar i, possiblement, el més conegut, és l'anomenat com a mètode *elbow*. Aquesta tècnica fa ús de la distància de cada observació respecte del seu centroide corresponent, el que es coneix com *distorsió*. La seua traducció literal és el mètode del *colze*, per la seua particular forma de escollir el nombre òptim de clústers.
+
+```{r}
+## Aplicació tècnica del colze
+for (any in names(df_anys_norm)) {
+  print(
+    fviz_nbclust(
+      df_anys_norm[[any]],
+      kmeans,
+      method = "wss"
+    ) + ggtitle(paste("Mètode del colze - Any", any))
+  )
+}
+```
+
+Fent ús d'aquesta primera tècnica, per als anys 2019, 2020 i 2021, el valor de *k* sembla 4, mentre que per a la resta d'anys sembla de 3.
+
+Es pot fer ús també del mètode de la silueta, que consisteix a representar gràficament com de bé s'ha classificat cadascuna de les observacions, tenint en compte la distància entre veïns.
+
+```{r}
+## Aplicació tècnica de la silueta
+for (any in names(df_anys_norm)) {
+  print(
+    fviz_nbclust(
+      df_anys_norm[[any]],
+      kmeans,
+      method = "silhouette"
+    ) + ggtitle(paste("Mètode de la silueta - Any", any))
+  )
+}
+```
+
+El resultat no coincideix amb el de la tècnica anterior, ja que el mètode de la silueta sugereix utilitzar el paràmetre *k = 2* per a tots els anys.
+
+Per tant, com que aquest mètode considera el valor *k = 2*, però l'anterior no el considerava òptim per a la majoria d'anys, es prendrà el primer com a referència.
+
+#### Determinació dels clùsters
+
+Com ja s'ha comentat, amb el valor *k = 4*, ja es pot observar el comportament del algorisme *k_means* amb aquest paràmetre.
+
+```{r}
+## Establiment reproduïbilitat
+set.seed(123)
+
+## Càlcul k-means amb k = 4 
+llista_clusters_k4 <- lapply(df_anys_norm, function(df) {
+  kmeans(df, centers = 4, nstart = 25)
+})
+llista_clusters_k4
+```
+
+Per a evaluar la qualitat dels diferents models (1 per cada any) es pot analitzar el següent:
+
+```{r}
+## Extracció qualitat models
+resultats_ss <- lapply(llista_clusters_k4, function(cl) {
+  list(
+    ssw = cl$withinss,
+    tssw = cl$tot.withinss,
+    ssb = cl$betweenss
+  )
+})
+
+for (any in names(resultats_ss)) {
+  cat("### Any:", any, "###\n")
+  print(resultats_ss[[any]])
+}
+```
+
+Els resultats d'aquestes proves de qualitat s'analitzen a l'apartat corresponent de la memòria del projecte.
+
+Prenent com a referència els valors que s'acaben d'obtenir, es poden calcular diversos índexs amb els que seguir avaluant la qualitat del model. Es tracta de tècniques de validació interna, és a dir, es fonamenten en el càlcul d'índexs basats en informació del model. En primer lloc, el quocient entre el total de la suma dels quadrats dintre del grup entre la suma dels quadrats entre grups, que posteriorment a la memòria es compara amb altres valors de *k.*
+
+```{r}
+## Càlcul d'índexs
+
+resultats_index <- list()
+
+for (any in names(llista_clusters_k4)) {
+ cl <- llista_clusters_k4[[any]]
+ ssw <- cl$tot.withinss
+ ssb <- cl$betweenss
+
+ BH <- ssw / 4
+ CH <- ssb / (4 - 1)
+ H <- log(ssb / ssw)
+ WB <- 4 * (ssw / ssb)
+
+ resultats_index[[any]] <- list(
+  Ball_Hall = BH,
+  Calinski_Harabasz = CH,
+  Hartigan = H,
+  WB_index = WB
+ )
+}
+
+df_resultats <- do.call(rbind, lapply(names(resultats_index), function(any) {
+ c(Any = any, resultats_index[[any]])
+}))
+kable(df_resultats, format = "markdown", col.names = c("Any", "Ball-Hall", "Calinski-Harabasz", "Hartigan", "WB Index"))
+
+```
+
+Per a constrastar aquests índexs, resulta necessari modificar el valor de *k* i veure l'efecte que sorgeix, com es va a fer seguidament.
+
+Abans, resulta interessant visualitzar els clústers generats per cada any:
+
+```{r}
+## Representació visual clústers
+plots_clusters <- mapply(function(model, data, any) {
+  fviz_cluster(model, data = data,
+               geom = "point",
+               ellipse.type = "norm",
+               main = paste("Clústers per a l'any", any))
+}, llista_clusters_k4, df_anys_norm, names(df_anys_norm), SIMPLIFY = FALSE)
+
+for (any in names(plots_clusters)) {
+  print(plots_clusters[[any]])
+}
+```
+
+A continuació, es va a fer la mateixa anàlisi, però canviant el valor del paràmetre *k.* En quest cas, es va a reduir el nombre de clústers fins a 2, com havia estat sugerit quan s'havia protat a terme la prova de la silueta. Per observar els canvis gràficament, es pot fer ús dels visuals ja utilitzats anteriorment. D'altra banda, per veure com ha evolucionat la qualitat del model i contrastar-la amb el model original, s'utilitzaran els mateixos índexs.
+
+```{r}
+## Establiment reproduïbilitat
+set.seed(123)
+
+## Càlcul k-means amb k = 2
+llista_clusters_k2 <- lapply(df_anys_norm, function(df) {
+  kmeans(df, centers = 2, nstart = 25)
+})
+llista_clusters_k2
+```
+
+```{r}
+## Extracció qualitat models
+resultats_ss <- lapply(llista_clusters_k2, function(cl) {
+  list(
+    ssw = cl$withinss,
+    tssw = cl$tot.withinss,
+    ssb = cl$betweenss
+  )
+})
+
+for (any in names(resultats_ss)) {
+  cat("### Any:", any, "###\n")
+  print(resultats_ss[[any]])
+}
+```
+
+```{r}
+## Càlcul d'índexs
+resultats_index <- list()
+
+for (any in names(llista_clusters_k2)) {
+ cl <- llista_clusters_k2[[any]]
+ ssw <- cl$tot.withinss
+ ssb <- cl$betweenss
+
+ BH <- ssw / 2
+ CH <- ssb / (2 - 1)
+ H <- log(ssb / ssw)
+ WB <- 2 * (ssw / ssb)
+
+ resultats_index[[any]] <- list(
+  Ball_Hall = BH,
+  Calinski_Harabasz = CH,
+  Hartigan = H,
+  WB_index = WB
+ )
+}
+
+df_resultats <- do.call(rbind, lapply(names(resultats_index), function(any) {
+ c(Any = any, resultats_index[[any]])
+}))
+kable(df_resultats, format = "markdown", col.names = c("Any", "Ball-Hall", "Calinski-Harabasz", "Hartigan", "WB Index"))
+```
+
+```{r}
+## Representació visual clústers
+plots_clusters <- mapply(function(model, data, any) {
+  fviz_cluster(model, data = data,
+               geom = "point",
+               ellipse.type = "norm",
+               main = paste("Clústers per a l'any", any))
+}, llista_clusters_k2, df_anys_norm, names(df_anys_norm), SIMPLIFY = FALSE)
+
+for (any in names(plots_clusters)) {
+  print(plots_clusters[[any]])
+}
+```
+
+### Representació geogràfica clústers
+
+A continuació, l'objectiu és representar geogràficament els clústers resultants. A partir d'un mapa dels diferents barris de la ciutat de Barcelona i associant a cada barri cada any el clúster que s'ha considerat, es va a representar gràficament la gentrificació als diferents barris.
+
+```{r}
+## Assignació clústers k = 4
+df_anys_raw <- list()
+for (any in anys) {
+  df_any <- df_cluster[df_cluster$Data_Referencia == any, ]
+  df_norm <- df_anys_norm[[as.character(any)]]
+  df_any_clean <- df_any[complete.cases(df_any[, vars]), ]
+  df_any_clean$Cluster <- as.factor(llista_clusters_k4[[as.character(any)]]$cluster)
+  df_anys_raw[[as.character(any)]] <- df_any_clean
+}
+```
+
+```{r}
+## Càrrega arxiu .shp dels barris
+shp_barris <- st_read("V2/0301040100_Barris_UNITATS_ADM.shp") %>%
+  st_transform(crs = 4326) %>%
+  rename(Codi_Barri = BARRI)
+```
+
+```{r}
+## Representació gràfica mapa gentrificació k = 4
+paleta = c("#00AFBB", "#E7B800", "#FC4E07", "#567423")
+for (any in anys) {
+  dades_any <- df_anys_raw[[as.character(any)]]
+  dades_geo <- left_join(shp_barris, dades_any, by = "Codi_Barri")
+
+  plot <- ggplot(dades_geo) +
+    geom_sf(aes(fill = Cluster), color = "white") +
+    scale_fill_manual(values = paleta) +
+    labs(title = paste("Clústers amb k = 4 per barris - Any", any)) +
+    theme_minimal()
+
+  print(plot)
+}
+```
+
+Els resultats es poden repetir amb el paràmetre *k = 2:*
+
+```{r}
+## Assignació clústers k = 2
+df_anys_raw <- list()
+for (any in anys) {
+  df_any <- df_cluster[df_cluster$Data_Referencia == any, ]
+  df_norm <- df_anys_norm[[as.character(any)]]
+  df_any_clean <- df_any[complete.cases(df_any[, vars]), ]
+  df_any_clean$Cluster <- as.factor(llista_clusters_k2[[as.character(any)]]$cluster)
+  df_anys_raw[[as.character(any)]] <- df_any_clean
+}
+```
+
+```{r}
+## Representació gràfica mapa gentrificació k = 2
+paleta = c("#00AFBB", "#FC4E07")
+for (any in anys) {
+  dades_any <- df_anys_raw[[as.character(any)]]
+  dades_geo <- left_join(shp_barris, dades_any, by = "Codi_Barri")
+
+  plot <- ggplot(dades_geo) +
+    geom_sf(aes(fill = Cluster), color = "white") +
+    scale_fill_manual(values = paleta) +
+    labs(title = paste("Clústers amb k = 2 per barris - Any", any)) +
+    theme_minimal()
+
+  print(plot)
+}
+```
